@@ -1,0 +1,300 @@
+name: Build 健康生活 APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    name: 构建 Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: package.json
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+
+      - name: Install web dependencies
+        run: npm install
+
+      - name: Build web app
+        run: npm run build
+
+      - name: Install Capacitor 8.5.2
+        run: |
+          npm install @capacitor/core@8.5.2 @capacitor/android@8.5.2
+          npm install --save-dev @capacitor/cli@8.5.2
+
+      - name: Create Capacitor config
+        run: |
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.healthlife.app",
+            "appName": "健康生活",
+            "webDir": "dist",
+            "bundledWebRuntime": false
+          }
+          EOF
+
+      - name: Create Android project
+        run: npx cap add android
+
+      - name: Add microphone permission
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('android/app/src/main/AndroidManifest.xml')
+          s = p.read_text(encoding='utf-8')
+          permission = '    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n'
+          if 'android.permission.RECORD_AUDIO' not in s:
+              s = s.replace('<manifest ', '<manifest ', 1)
+              pos = s.find('>')
+              s = s[:pos+1] + '\n' + permission + s[pos+1:]
+          p.write_text(s, encoding='utf-8')
+          PY
+
+      - name: Install native Android bridge
+        run: |
+          mkdir -p android/app/src/main/java/com/healthlife/app
+          cat > android/app/src/main/java/com/healthlife/app/MainActivity.java <<'JAVA'
+          package com.healthlife.app;
+
+          import android.Manifest;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.content.Intent;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.speech.RecognitionListener;
+          import android.speech.RecognizerIntent;
+          import android.speech.SpeechRecognizer;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+
+          import com.getcapacitor.BridgeActivity;
+
+          import org.json.JSONObject;
+
+          import java.util.ArrayList;
+
+          public class MainActivity extends BridgeActivity {
+              private static final int REQ_MIC = 7001;
+              private AndroidBridge androidBridge;
+              private boolean pendingVoiceStart = false;
+
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  androidBridge = new AndroidBridge(this);
+                  getBridge().getWebView().addJavascriptInterface(androidBridge, "AndroidBridge");
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (androidBridge != null) androidBridge.destroy();
+                  super.onDestroy();
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == REQ_MIC) {
+                      if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED && pendingVoiceStart) {
+                          pendingVoiceStart = false;
+                          androidBridge.startVoiceInternal();
+                      } else {
+                          pendingVoiceStart = false;
+                          androidBridge.sendError("请允许“健康生活”使用麦克风");
+                      }
+                  }
+              }
+
+              private static class AndroidBridge {
+                  private final MainActivity activity;
+                  private final WebView webView;
+                  private final SharedPreferences prefs;
+                  private final Handler main = new Handler(Looper.getMainLooper());
+                  private SpeechRecognizer recognizer;
+                  private boolean listening = false;
+
+                  AndroidBridge(MainActivity activity) {
+                      this.activity = activity;
+                      this.webView = activity.getBridge().getWebView();
+                      this.prefs = activity.getSharedPreferences("health_life_data", Context.MODE_PRIVATE);
+                  }
+
+                  @JavascriptInterface
+                  public String load(String key) {
+                      return prefs.getString(key, null);
+                  }
+
+                  @JavascriptInterface
+                  public void save(String key, String value) {
+                      prefs.edit().putString(key, value == null ? "" : value).apply();
+                  }
+
+                  @JavascriptInterface
+                  public void remove(String key) {
+                      prefs.edit().remove(key).apply();
+                  }
+
+                  @JavascriptInterface
+                  public void startVoice() {
+                      main.post(() -> {
+                          if (listening) {
+                              stopVoiceInternal();
+                              return;
+                          }
+                          if (activity.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                              activity.pendingVoiceStart = true;
+                              activity.requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
+                              return;
+                          }
+                          startVoiceInternal();
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public void stopVoice() {
+                      main.post(this::stopVoiceInternal);
+                  }
+
+                  void startVoiceInternal() {
+                      main.post(() -> {
+                          if (listening) return;
+                          if (!SpeechRecognizer.isRecognitionAvailable(activity)) {
+                              sendError("此手机没有可用的系统语音识别服务");
+                              return;
+                          }
+                          try {
+                              cleanupRecognizer();
+                              recognizer = SpeechRecognizer.createSpeechRecognizer(activity);
+                              recognizer.setRecognitionListener(new RecognitionListener() {
+                                  @Override public void onReadyForSpeech(Bundle params) { listening = true; sendState("started"); }
+                                  @Override public void onBeginningOfSpeech() { }
+                                  @Override public void onRmsChanged(float rmsdB) { }
+                                  @Override public void onBufferReceived(byte[] buffer) { }
+                                  @Override public void onEndOfSpeech() { listening = false; sendState("stopped"); }
+                                  @Override public void onPartialResults(Bundle partialResults) { }
+                                  @Override public void onEvent(int eventType, Bundle params) { }
+                                  @Override public void onError(int error) { listening = false; sendState("stopped"); sendError(errorMessage(error)); cleanupRecognizer(); }
+                                  @Override public void onResults(Bundle results) {
+                                      listening = false;
+                                      ArrayList<String> matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                                      String text = (matches != null && !matches.isEmpty()) ? matches.get(0) : "";
+                                      sendResult(text);
+                                      sendState("stopped");
+                                      cleanupRecognizer();
+                                  }
+                              });
+                              Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+                              intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+                              intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "zh-CN");
+                              intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "zh-CN");
+                              intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
+                              intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
+                              intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "请说出一笔消费，例如：午餐花了35元");
+                              recognizer.startListening(intent);
+                          } catch (Exception e) {
+                              listening = false;
+                              sendError("麦克风启动失败，请检查系统权限");
+                              cleanupRecognizer();
+                          }
+                      });
+                  }
+
+                  private void stopVoiceInternal() {
+                      main.post(() -> {
+                          if (recognizer != null) {
+                              try { recognizer.stopListening(); } catch (Exception ignored) {}
+                              try { recognizer.cancel(); } catch (Exception ignored) {}
+                          }
+                          listening = false;
+                          sendState("stopped");
+                          cleanupRecognizer();
+                      });
+                  }
+
+                  private void cleanupRecognizer() {
+                      if (recognizer != null) {
+                          try { recognizer.cancel(); } catch (Exception ignored) {}
+                          try { recognizer.destroy(); } catch (Exception ignored) {}
+                          recognizer = null;
+                      }
+                  }
+
+                  void destroy() {
+                      main.post(() -> { listening = false; cleanupRecognizer(); });
+                  }
+
+                  void sendResult(String text) {
+                      runJS("window.onNativeSpeechResult(" + JSONObject.quote(text == null ? "" : text) + ");");
+                  }
+
+                  void sendError(String message) {
+                      runJS("window.onNativeSpeechError(" + JSONObject.quote(message == null ? "识别失败" : message) + ");");
+                  }
+
+                  private void sendState(String status) {
+                      runJS("window.onNativeSpeechState(" + JSONObject.quote(status) + ");");
+                  }
+
+                  private void runJS(String js) {
+                      webView.post(() -> webView.evaluateJavascript(js, null));
+                  }
+
+                  private String errorMessage(int error) {
+                      switch (error) {
+                          case SpeechRecognizer.ERROR_AUDIO: return "麦克风音频错误，请重试";
+                          case SpeechRecognizer.ERROR_CLIENT: return "语音识别客户端错误，请重试";
+                          case SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS: return "没有麦克风权限";
+                          case SpeechRecognizer.ERROR_NETWORK: return "语音识别网络错误，请检查网络";
+                          case SpeechRecognizer.ERROR_NETWORK_TIMEOUT: return "语音识别网络超时";
+                          case SpeechRecognizer.ERROR_NO_MATCH: return "没有听清，请再说一次";
+                          case SpeechRecognizer.ERROR_RECOGNIZER_BUSY: return "语音识别正在使用，请稍后再试";
+                          case SpeechRecognizer.ERROR_SERVER: return "语音识别服务暂时不可用";
+                          case SpeechRecognizer.ERROR_SPEECH_TIMEOUT: return "没有检测到说话，请再试一次";
+                          default: return "语音识别失败，请重试";
+                      }
+                  }
+              }
+          }
+          JAVA
+
+      - name: Sync Capacitor
+        run: npx cap sync android
+
+      - name: Build Debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: 健康生活APP-修复版
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
