@@ -1,0 +1,113 @@
+name: Build 健康生活 APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    name: 构建 Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # 1. 下载你的 GitHub 项目
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. 固定使用 Node.js 22
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: package.json
+
+      # 3. 固定使用 Java 21
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      # 4. 配置 Android SDK
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+
+      # 5. 检查编译环境
+      - name: Check environment
+        run: |
+          echo "===== Node ====="
+          node --version
+
+          echo "===== NPM ====="
+          npm --version
+
+          echo "===== Java ====="
+          java -version
+
+          echo "===== Android SDK ====="
+          echo "$ANDROID_SDK_ROOT"
+
+      # 6. 安装项目依赖
+      - name: Install project dependencies
+        run: |
+          npm install
+
+      # 7. 构建网页
+      - name: Build web application
+        run: |
+          npm run build
+
+      # 8. 安装 Capacitor
+      - name: Install Capacitor
+        run: |
+          npm install @capacitor/core@8.5.2
+          npm install @capacitor/android@8.5.2
+          npm install --save-dev @capacitor/cli@8.5.2
+
+      # 9. 创建 Capacitor 配置
+      - name: Create Capacitor config
+        run: |
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.healthlife.app",
+            "appName": "健康生活",
+            "webDir": "dist",
+            "bundledWebRuntime": false
+          }
+          EOF
+
+      # 10. 检查 Capacitor
+      - name: Check Capacitor
+        run: |
+          npx cap --version
+
+      # 11. 创建 Android 原生工程
+      - name: Add Android platform
+        run: |
+          npx cap add android
+
+      # 12. 同步网页到 Android
+      - name: Sync Android project
+        run: |
+          npx cap sync android
+
+      # 13. 构建 APK
+      - name: Build Debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      # 14. 上传 APK
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: 健康生活APP-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
