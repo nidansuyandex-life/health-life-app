@@ -1,0 +1,26 @@
+name: Build 健康生活 APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build APK
+        uses: cemcoe/web-to-apk-action@v1
+        with:
+          app_name: "健康生活"
+          app_id: "com.healthlife.app"
+          build_command: "npm install && npm run build"
+          web_dir: "dist"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: 健康生活APP
+          path: "**/*.apk"
