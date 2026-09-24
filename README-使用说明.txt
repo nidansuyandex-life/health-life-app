@@ -18,3 +18,6 @@
 - Android 原生语音识别桥
 - Android SharedPreferences 与网页 localStorage 双写，增强退出 App 后数据保留
 - 不依赖 Android Studio
+
+
+本 v2 修复：删除与 Capacitor 8 BridgeActivity 不兼容的 MainActivity.onDestroy() override，解决 cannot override onDestroy() 编译错误。
